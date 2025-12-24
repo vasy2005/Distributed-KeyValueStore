@@ -1,17 +1,14 @@
-#include "entry.h"
+#ifndef HASH_MAP_H
+#define HASH_MAP_H
 
-struct HashEntry
+typedef struct HashEntry
 {
     char* key;
-    Entry* value;
+    char* value;
+    // int value_len;
+
     HashEntry* nextEntry;
     HashEntry* prevEntry;
-};
+} HashEntry;
 
-class Hashmap
-{
-private:
-    HashEntry* entry;
-    
-
-};
+#endif
