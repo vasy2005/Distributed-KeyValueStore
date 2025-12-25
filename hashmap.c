@@ -26,14 +26,19 @@ long long int get_hash_from_key(const char* key)
     return index;
 }
 
-HashEntry* insert(const char* key, const char* value)
+HashEntry* insert_in_hash(const char* key, const char* value, long long ttl)
 {
     long long int index = get_hash_from_key(key);
     for (HashEntry* it = hashmap[index]; it != NULL; it = it->nextEntry)
         if (strcmp(it->key, key) == 0)
         {
-            free(it->value);
-            it->value = strdup(value);
+            if (it->is_swapped == 0)
+                free(it->storage.ram_value);
+
+            it->ttl = ttl;
+            it->storage.ram_value = strdup(value);
+            it->value_len = strlen(value);
+            it->is_swapped = 0;
             return it;
         }
 
@@ -41,8 +46,10 @@ HashEntry* insert(const char* key, const char* value)
     if (hashEntry == NULL)
         return NULL;
     
+    hashEntry->ttl = ttl;
     hashEntry->key = strdup(key);
-    hashEntry->value = strdup(value);
+    hashEntry->storage.ram_value = strdup(value);
+    hashEntry->value_len = strlen(value);
 
     hashEntry->nextEntry = hashmap[index];
     hashEntry->prevEntry = NULL;
@@ -54,24 +61,29 @@ HashEntry* insert(const char* key, const char* value)
     return hashEntry;
 }
 
-HashEntry* get(const char* key)
-{
-    long long index = get_hash_from_key(key);
-    for (HashEntry* it = hashmap[index]; it != NULL; it = it->nextEntry)
-        if (strcmp(it->key, key) == 0)
-            return it;
-
-    return NULL;
-}
-
-void delete(const char* key)
+HashEntry* get_from_hash(const char* key)
 {
     long long index = get_hash_from_key(key);
     for (HashEntry* it = hashmap[index]; it != NULL; it = it->nextEntry)
         if (strcmp(it->key, key) == 0)
         {
-            free(it->key); free(it->value);
+            if (it->is_swapped == 0)
+                return it;
+        }
 
+    return NULL;
+}
+
+void delete_from_hash(const char* key)
+{
+    long long index = get_hash_from_key(key);
+    for (HashEntry* it = hashmap[index]; it != NULL; it = it->nextEntry)
+        if (strcmp(it->key, key) == 0)
+        {
+            free(it->key); 
+            if (it->is_swapped == 0)
+                free(it->storage.ram_value);
+            
             if (it->prevEntry != NULL)
                 it->prevEntry->nextEntry = it->nextEntry;
             else

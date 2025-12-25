@@ -7,14 +7,22 @@
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <pthread.h>
+#include <fcntl.h>
+
+#include "thpool.h"
+#include "hashmap.h"
 
 #define MASTER 0
 #define SLAVE 1
-#define MSG_LEN 100
+#define MSG_LEN 1000 //TODO: Could be buffer overflow
 #define MAX_SLAVES 10
 #define QUEUE_LEN 100
 #define FD_MAX 1024
+#define READ_WORKERS 8
+#define SWAP_FILE "./swap_file.bin"
 
 extern int errno;
 
@@ -50,8 +58,8 @@ typedef struct
 int master_compute(int);
 int slave_compute(int);
 void delete_slave(int);
-int get(const char*, char*);
-int set(const char*, const char*, int);
+int get(int, const char*, char*);
+HashEntry* set(const char*, const char*, int);
 int del(const char*);
 int fd_write(int, const char*);
 int fd_read(int, char*);
@@ -71,10 +79,44 @@ int slave_counter = 0;
 // Variables for SLAVE
 int fd_master;
 
+// Variables for both
+struct sockaddr_in server;
+struct sockaddr_in from;
+fd_set readfds;
+fd_set actfds;
+struct timeval tv;
+int sd, client;
+int optval = 1;
+int fd;
+int nfds;
+int len;
+
+int swap_fd;
+
+threadpool disk_thpool; //for reading from disk
+int disk_pipe[2];
+typedef struct 
+{
+    long long offset;
+    long long len;
+    HashEntry* entry;
+    int client_fd;
+    int pipe_fd;
+} DiskJob;
+
+typedef struct
+{
+    char* value;
+    HashEntry* entry;
+    int client_fd;
+} DiskJobResult;
+
+
 Client clients[FD_MAX];
 
 int main(int argc, char *argv[])
 {
+    //initial setup
     PORT = atoi(argv[1]);
     if (argc == 5 && !strcmp(argv[2], "SLAVE"))
         server_type = SLAVE;
@@ -92,18 +134,27 @@ int main(int argc, char *argv[])
         fd_master = slave_setup(argv[3], atoi(argv[4]));
     }
 
-    struct sockaddr_in server;
-    struct sockaddr_in from;
-    fd_set readfds;
-    fd_set actfds;
-    struct timeval tv;
-    int sd, client;
-    int optval = 1;
-    int fd;
+    if ((swap_fd = open(SWAP_FILE, O_RDWR | O_CREAT | O_TRUNC, 0666)) == -1)
+    {
+        perror("Swap file couldn't be created / opened");
+        exit(1);
+    }
 
-    int nfds;
-    int len;
+    if (pipe(disk_pipe) < 0)
+    {
+        perror("Pipe couldn't be created.");
+        exit(1);
+    }
 
+    if (create_hashmap() == NULL)
+    {
+        printf("Hashmap couldn't be created.");
+        exit(1);
+    }
+
+    disk_thpool = thpool_init(READ_WORKERS);
+
+    //server connection
     if ((sd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
     {
         perror("[server] Eroare la socket().\n");
@@ -134,6 +185,7 @@ int main(int argc, char *argv[])
     FD_SET(sd, &actfds);
     if (server_type == SLAVE)
         FD_SET(fd_master, &actfds);
+    FD_SET(disk_pipe[0], &actfds);
 
     tv.tv_sec = 1;
     tv.tv_usec = 0;
@@ -143,11 +195,13 @@ int main(int argc, char *argv[])
     printf("[server] Asteptam la portul %d...\n", PORT);
     fflush(stdout);
     
+    //server starting
     FD_ZERO(&slavefds);
     while(1)
     {
         memcpy((char*)&readfds, (char*)&actfds, sizeof(readfds));
         
+        //TODO: use epoll
         if (select(nfds+1, &readfds, NULL, NULL, &tv) < 0)
         {
             perror("[server] Eroare la select().\n");
@@ -155,6 +209,20 @@ int main(int argc, char *argv[])
         }
 
         //TODO: la fiecare secunda testez daca trebuie sters cnv, pe MASTER
+
+        if (FD_ISSET(disk_pipe[0], &readfds))
+        {
+            DiskJobResult result;
+            read(disk_pipe[0], &result, sizeof(DiskJobResult));
+
+            result.entry->storage.ram_value = result.value;
+            result.entry->is_swapped = 0;
+            
+            fd_write(result.client_fd, result.entry->storage.ram_value);
+
+            FD_SET(result.client_fd, &actfds);
+            // TODO: what if entry was deleted in the meantime? 
+        }
 
         if (FD_ISSET(sd, &readfds))
         {
@@ -328,13 +396,18 @@ int master_compute(int fd)
     {
         if (slave_counter == 0)
         {
+            ans[0] = 0;
             char value[MSG_LEN];
-            if (get(key, value) < 0)
+            int status = 0;
+            if ((status = get(fd, key, value)) < 0)
                 strcpy(ans, "[SERVER] GET FAILED");
             else
-                strcpy(ans, value);
+                if (status > 0)
+                    strcpy(ans, value);
+                else
+                    return bytes;
                 
-            if (fd_write(fd, ans) < 0)
+            if (ans[0] != 0 && fd_write(fd, ans) < 0)
                 return -1;
             return bytes;
         }
@@ -358,7 +431,7 @@ int master_compute(int fd)
     char value[MSG_LEN]; int ttl;
     if (sscanf(msg, "SET %s %s %d", key, value, &ttl) == 3)
     {
-        if (set(key, value, ttl) < 0)
+        if (set(key, value, ttl) == NULL)
             strcpy(ans, "[SERVER] SET FAILED");
         else
             strcpy(ans, "[SERVER] SET DONE SUCCESSFULLY");
@@ -409,13 +482,18 @@ int slave_compute(int fd)
     char key[MSG_LEN];
     if (sscanf(msg, "GET %s", key) == 1)
     {
+        ans[0] = 0;
         char value[MSG_LEN];
-        if (get(key, value) < 0)
+        int status = 0;
+        if ((status = get(fd, key, value)) < 0)
             strcpy(ans, "[SERVER] GET FAILED");
         else
-            strcpy(ans, value);
-            
-        if (fd_write(fd, ans) <= 0)
+            if (status > 0)
+                strcpy(ans, value);
+            else
+                return bytes;
+
+        if (ans[0] != 0 && fd_write(fd, ans) <= 0)
             return -1;
         return bytes;
     }
@@ -423,7 +501,7 @@ int slave_compute(int fd)
     char value[MSG_LEN]; int ttl;
     if (sscanf(msg, "SET %s %s %d", key, value, &ttl) == 3)
     {
-        if (set(key, value, ttl) < 0)
+        if (set(key, value, ttl) == NULL)
             strcpy(ans, "[server] SET FAILED.\n");
         else
             strcpy(ans, "[server] SET DONE SUCCESSFULLY.\n");
@@ -465,22 +543,65 @@ void delete_slave(int fd)
     slave_counter --;
 }
 
-int get(const char* key, char* value)
+int get(int fd, const char* key, char* value)
 {
-    //get value from memory
-    strcpy(value, key);
-    return 0; //-1 for error
+    value[0] = 0;
+    HashEntry* entry = get_from_hash(key);
+    if (entry == NULL)
+        return -1;
+
+    if (entry->is_swapped == 0)
+    {
+        strcpy(value, entry->storage.ram_value);
+        return 1;
+    }
+
+    //add get to thread, block fd
+    //add to thread
+    DiskJob* job = malloc(sizeof(DiskJob));
+    job->offset = entry->storage.disk_offset;
+    job->client_fd = fd;
+    job->len = entry->value_len;
+    job->pipe_fd = disk_pipe[1];
+    job->entry = entry;
+
+    thpool_add_work(disk_thpool, get_from_disk, job);
+    FD_CLR(fd, &actfds);
+    return 0;
 }
 
-int set(const char* key, const char* value, int ttl)
+void get_from_disk(void *arg)
 {
-    //add key:value
-    return 0; //-1 for error
+    DiskJob* job = (DiskJob*)arg;
+
+    char* buffer = malloc(job->len+1);
+
+    int bytes = pread(swap_fd, buffer, job->len, job->offset);
+    if (bytes > 0)
+        buffer[bytes] = 0;
+    else
+        buffer[0] = 0;
+
+    DiskJobResult result;
+
+    result.client_fd = job->client_fd;
+    result.entry = job->entry;
+    result.value = buffer;
+
+    write(job->pipe_fd, &result, sizeof(result));
+
+    free(job);
+}
+
+HashEntry* set(const char* key, const char* value, int ttl)
+{
+    HashEntry* entry = insert_in_hash(key, value, ttl);
+    return entry;
 }
 
 int del(const char* key)
 {
-    //add key:value
+    delete_from_hash(key);
     return 0; //-1 for error
 }
 
