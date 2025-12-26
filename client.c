@@ -6,10 +6,10 @@
 #include <errno.h>
 #include <stdio.h>
 #include <arpa/inet.h>
-#include <string.h>`
+#include <string.h>
 #include <stdlib.h>
 
-#define MSG_LEN 100
+#define MSG_LEN 1000
 #define STDIN 0
 
 extern int errno;

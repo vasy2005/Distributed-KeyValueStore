@@ -15,6 +15,8 @@
 #include "thpool.h"
 #include "hashmap.h"
 
+//TODO SLAVE: la reconexiune, isi pierde baza de date
+
 #define MASTER 0
 #define SLAVE 1
 #define MSG_LEN 1000 //TODO: Could be buffer overflow
@@ -23,6 +25,7 @@
 #define FD_MAX 1024
 #define READ_WORKERS 8
 #define SWAP_FILE "./swap_file.bin"
+#define MAX_RAM 1073741824
 
 extern int errno;
 
@@ -67,6 +70,10 @@ int slave_setup(char*, int);
 const char* get_ip_from_fd(int);
 int execute_multi_commands(char [][MSG_LEN], int, int);
 void strip_msg(char*);
+void get_from_disk(void *arg);
+void eviction(void *arg);
+int write_to_swap(char*, int);
+void send_to_evict();
 
 int PORT = 5000;
 int server_type = MASTER;
@@ -93,13 +100,19 @@ int len;
 
 int swap_fd;
 
+typedef struct 
+{
+    pthread_t idThread;
+    int thCount;
+} Thread;
+
 threadpool disk_thpool; //for reading from disk
 int disk_pipe[2];
 typedef struct 
 {
     long long offset;
     long long len;
-    HashEntry* entry;
+    char* key;
     int client_fd;
     int pipe_fd;
 } DiskJob;
@@ -107,10 +120,28 @@ typedef struct
 typedef struct
 {
     char* value;
-    HashEntry* entry;
+    char* key;
     int client_fd;
 } DiskJobResult;
 
+Thread eviction_thread;
+int main_to_thread_evictpipe[2];
+int thread_to_main_evictpipe[2];
+typedef struct
+{
+    long long offset;
+    char key[MSG_LEN];
+    int version;
+} EvictionResult;
+typedef struct
+{
+    char *value;
+    char key[MSG_LEN];
+    long long len;
+    int version;
+} EvictionMsg;
+
+int global_file_end = 0;
 
 Client clients[FD_MAX];
 
@@ -154,6 +185,20 @@ int main(int argc, char *argv[])
 
     disk_thpool = thpool_init(READ_WORKERS);
 
+    pthread_create(&eviction_thread, NULL, eviction, NULL);
+    if (pipe(main_to_thread_evictpipe) < 0)
+    {
+        perror("Pipe couldn't be created.");
+        exit(1);
+    }
+    if (pipe(thread_to_main_evictpipe) < 0)
+    {
+        perror("Pipe couldn't be created.");
+        exit(1);
+    }
+
+    lru_init();
+
     //server connection
     if ((sd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
     {
@@ -186,6 +231,7 @@ int main(int argc, char *argv[])
     if (server_type == SLAVE)
         FD_SET(fd_master, &actfds);
     FD_SET(disk_pipe[0], &actfds);
+    FD_SET(thread_to_main_evictpipe[0], &actfds);
 
     tv.tv_sec = 1;
     tv.tv_usec = 0;
@@ -210,18 +256,54 @@ int main(int argc, char *argv[])
 
         //TODO: la fiecare secunda testez daca trebuie sters cnv, pe MASTER
 
+        if (FD_ISSET(thread_to_main_evictpipe[0], &readfds))
+        {
+            EvictionResult result;
+            read(thread_to_main_evictpipe[0], &result, sizeof(EvictionResult));
+            HashEntry* entry = get_from_key(result.key);
+            
+            if (entry != NULL && result.version == entry->version)
+            {
+                entry->is_swapped = 1;
+                entry->storage.disk_offset = result.offset;
+                
+                lru_remove(entry);
+
+                entry->pending_eviction = 0;
+                free(entry->storage.ram_value);
+                entry->storage.ram_value = NULL;
+
+                memory_used -= entry->value_len;
+            }
+        }
+
         if (FD_ISSET(disk_pipe[0], &readfds))
         {
             DiskJobResult result;
             read(disk_pipe[0], &result, sizeof(DiskJobResult));
+            HashEntry* entry = get_from_key(result.key);
 
-            result.entry->storage.ram_value = result.value;
-            result.entry->is_swapped = 0;
-            
-            fd_write(result.client_fd, result.entry->storage.ram_value);
+            if (entry != NULL)
+            {
+                if (entry->is_swapped == 1)
+                {
+                    entry->storage.ram_value = result.value;
+                    entry->is_swapped = 0;
+                    memory_used += entry->value_len + 1;
+                }
+                else
+                    free(result.value);
+                lru_promote(entry);
+                
+                fd_write(result.client_fd, entry->storage.ram_value);
 
-            FD_SET(result.client_fd, &actfds);
-            // TODO: what if entry was deleted in the meantime? 
+                FD_SET(result.client_fd, &actfds);
+
+                // TODO: what if entry was deleted in the meantime? 
+            }
+            else
+                free(result.value);
+            free(result.key);
         }
 
         if (FD_ISSET(sd, &readfds))
@@ -275,7 +357,9 @@ int main(int argc, char *argv[])
 
                 }
 
-            }       
+            }    
+            
+        send_to_evict();
     }
 }
 
@@ -546,12 +630,13 @@ void delete_slave(int fd)
 int get(int fd, const char* key, char* value)
 {
     value[0] = 0;
-    HashEntry* entry = get_from_hash(key);
+    HashEntry* entry = get_from_key(key);
     if (entry == NULL)
         return -1;
 
     if (entry->is_swapped == 0)
     {
+        lru_promote(entry);
         strcpy(value, entry->storage.ram_value);
         return 1;
     }
@@ -563,7 +648,7 @@ int get(int fd, const char* key, char* value)
     job->client_fd = fd;
     job->len = entry->value_len;
     job->pipe_fd = disk_pipe[1];
-    job->entry = entry;
+    job->key = strdup(entry->key);
 
     thpool_add_work(disk_thpool, get_from_disk, job);
     FD_CLR(fd, &actfds);
@@ -585,7 +670,7 @@ void get_from_disk(void *arg)
     DiskJobResult result;
 
     result.client_fd = job->client_fd;
-    result.entry = job->entry;
+    result.key = job->key;
     result.value = buffer;
 
     write(job->pipe_fd, &result, sizeof(result));
@@ -596,6 +681,7 @@ void get_from_disk(void *arg)
 HashEntry* set(const char* key, const char* value, int ttl)
 {
     HashEntry* entry = insert_in_hash(key, value, ttl);
+    lru_promote(entry);
     return entry;
 }
 
@@ -610,6 +696,59 @@ int execute_multi_commands(char queue[][MSG_LEN], int st, int dr)
     //execute multi commands
 
     return 0; //-1 for faiilure
+}
+
+void send_to_evict()
+{
+    if (memory_used*1.0 >= MAX_RAM*0.8)
+    {
+        HashEntry* entry = lru_cache.tail;
+        for (int i = 0; entry != NULL && i < 10; i++, 
+                                entry = entry->lru_prev)
+        {
+            if (entry->pending_eviction == 1)
+            {
+                i--;
+                continue;
+            }
+            char* value = strdup(entry->storage.ram_value);
+            EvictionMsg msg;
+            msg.len = entry->value_len;
+            msg.value = value;
+            msg.key[0] = 0;
+            msg.version = entry->version;
+            strcpy(msg.key, entry->key);
+            write(main_to_thread_evictpipe[1], &msg, sizeof(EvictionMsg));
+            entry->pending_eviction = 1;
+        }
+    }
+}
+
+void eviction(void* arg)
+{
+    EvictionMsg msg;
+    EvictionResult result;
+    while(1)
+    {
+        if (read(main_to_thread_evictpipe[0], &msg, sizeof(EvictionMsg)) >= 0)
+        {
+            result.offset = write_to_swap(msg.value, msg.len);
+            result.key[0] = 0; strcpy(result.key, msg.key);
+            result.version = msg.version;
+
+            write(thread_to_main_evictpipe[1], &result, sizeof(EvictionResult));
+        }
+    }
+}
+
+int write_to_swap(char* value, int len)
+{
+    int offset = global_file_end;
+    global_file_end += len;
+
+    pwrite(swap_fd, value, len, offset);
+
+    return offset;
 }
 
 int fd_write(int fd, const char *msg)
