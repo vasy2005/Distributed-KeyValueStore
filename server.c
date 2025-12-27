@@ -24,8 +24,9 @@
 #define QUEUE_LEN 100
 #define FD_MAX 1024
 #define READ_WORKERS 8
-#define SWAP_FILE "./swap_file.bin"
-#define MAX_RAM 1073741824
+#define MAX_RAM 300LL
+#define EVICTION_LIMIT 0.9f
+#define EVICTION_BATCH_SIZE 20
 
 extern int errno;
 
@@ -62,7 +63,7 @@ int master_compute(int);
 int slave_compute(int);
 void delete_slave(int);
 int get(int, const char*, char*);
-HashEntry* set(const char*, const char*, int);
+HashEntry* set(const char*, const char*, long long);
 int del(const char*);
 int fd_write(int, const char*);
 int fd_read(int, char*);
@@ -71,9 +72,10 @@ const char* get_ip_from_fd(int);
 int execute_multi_commands(char [][MSG_LEN], int, int);
 void strip_msg(char*);
 void get_from_disk(void *arg);
-void eviction(void *arg);
+void* eviction(void *arg);
 int write_to_swap(char*, int);
 void send_to_evict();
+void check_expired();
 
 int PORT = 5000;
 int server_type = MASTER;
@@ -97,6 +99,9 @@ int optval = 1;
 int fd;
 int nfds;
 int len;
+
+int eviction_active = 0;
+int current_check_expired = 0;
 
 int swap_fd;
 
@@ -165,7 +170,9 @@ int main(int argc, char *argv[])
         fd_master = slave_setup(argv[3], atoi(argv[4]));
     }
 
-    if ((swap_fd = open(SWAP_FILE, O_RDWR | O_CREAT | O_TRUNC, 0666)) == -1)
+    char swap_file[MSG_LEN];
+    sprintf(swap_file, "swap_file_%d.bin", PORT);
+    if ((swap_fd = open(swap_file, O_RDWR | O_CREAT | O_TRUNC, 0666)) == -1)
     {
         perror("Swap file couldn't be created / opened");
         exit(1);
@@ -185,7 +192,7 @@ int main(int argc, char *argv[])
 
     disk_thpool = thpool_init(READ_WORKERS);
 
-    pthread_create(&eviction_thread, NULL, eviction, NULL);
+    pthread_create(&eviction_thread.idThread, NULL, eviction, NULL);
     if (pipe(main_to_thread_evictpipe) < 0)
     {
         perror("Pipe couldn't be created.");
@@ -258,27 +265,34 @@ int main(int argc, char *argv[])
 
         if (FD_ISSET(thread_to_main_evictpipe[0], &readfds))
         {
+            FD_CLR(thread_to_main_evictpipe[0], &readfds);
             EvictionResult result;
             read(thread_to_main_evictpipe[0], &result, sizeof(EvictionResult));
             HashEntry* entry = get_from_key(result.key);
             
             if (entry != NULL && result.version == entry->version)
             {
+                free(entry->storage.ram_value);
+
                 entry->is_swapped = 1;
                 entry->storage.disk_offset = result.offset;
                 
                 lru_remove(entry);
-
+                
                 entry->pending_eviction = 0;
-                free(entry->storage.ram_value);
-                entry->storage.ram_value = NULL;
-
-                memory_used -= entry->value_len;
+                
+                memory_used -= entry->value_len+1;
+                
+                printf("[server] Resursa cu cheia %s evacuata pe swap file\n", entry->key);
             }
+            else
+                printf("[server] linia 281\n");
         }
 
         if (FD_ISSET(disk_pipe[0], &readfds))
         {
+            printf("am primit de la disk read thread\n");
+            FD_CLR(disk_pipe[0], &readfds);
             DiskJobResult result;
             read(disk_pipe[0], &result, sizeof(DiskJobResult));
             HashEntry* entry = get_from_key(result.key);
@@ -290,6 +304,8 @@ int main(int argc, char *argv[])
                     entry->storage.ram_value = result.value;
                     entry->is_swapped = 0;
                     memory_used += entry->value_len + 1;
+
+                    printf("[server] Resursa cu cheia %s luata de pe swap file.", entry->key);
                 }
                 else
                     free(result.value);
@@ -302,12 +318,18 @@ int main(int argc, char *argv[])
                 // TODO: what if entry was deleted in the meantime? 
             }
             else
-                free(result.value);
+                {
+                    free(result.value);
+                    fd_write(result.client_fd, "GET FAILED");
+                }
             free(result.key);
         }
 
         if (FD_ISSET(sd, &readfds))
         {
+
+            printf("am primit de la read\n");
+            FD_CLR(sd, &readfds);
             len = sizeof(from);
             memset(&from, 0, sizeof(from));
 
@@ -333,7 +355,7 @@ int main(int argc, char *argv[])
         }
 
         for (fd = 0; fd <= nfds; fd++)
-            if (fd != sd && FD_ISSET(fd, &readfds))
+            if (FD_ISSET(fd, &readfds))
             {
                 int(*compute)(int) = 0;
                 if (server_type == MASTER)
@@ -360,6 +382,7 @@ int main(int argc, char *argv[])
             }    
             
         send_to_evict();
+        check_expired();
     }
 }
 
@@ -512,8 +535,8 @@ int master_compute(int fd)
         return bytes;
     }
 
-    char value[MSG_LEN]; int ttl;
-    if (sscanf(msg, "SET %s %s %d", key, value, &ttl) == 3)
+    char value[MSG_LEN]; long long ttl;
+    if (sscanf(msg, "SET %s %s %lld", key, value, &ttl) == 3)
     {
         if (set(key, value, ttl) == NULL)
             strcpy(ans, "[SERVER] SET FAILED");
@@ -582,8 +605,8 @@ int slave_compute(int fd)
         return bytes;
     }
 
-    char value[MSG_LEN]; int ttl;
-    if (sscanf(msg, "SET %s %s %d", key, value, &ttl) == 3)
+    char value[MSG_LEN]; long long ttl;
+    if (sscanf(msg, "SET %s %s %lld", key, value, &ttl) == 3)
     {
         if (set(key, value, ttl) == NULL)
             strcpy(ans, "[server] SET FAILED.\n");
@@ -662,6 +685,7 @@ void get_from_disk(void *arg)
     char* buffer = malloc(job->len+1);
 
     int bytes = pread(swap_fd, buffer, job->len, job->offset);
+    
     if (bytes > 0)
         buffer[bytes] = 0;
     else
@@ -678,7 +702,7 @@ void get_from_disk(void *arg)
     free(job);
 }
 
-HashEntry* set(const char* key, const char* value, int ttl)
+HashEntry* set(const char* key, const char* value, long long ttl)
 {
     HashEntry* entry = insert_in_hash(key, value, ttl);
     lru_promote(entry);
@@ -693,17 +717,25 @@ int del(const char* key)
 
 int execute_multi_commands(char queue[][MSG_LEN], int st, int dr)
 {
-    //execute multi commands
-
+    
     return 0; //-1 for faiilure
 }
 
 void send_to_evict()
 {
-    if (memory_used*1.0 >= MAX_RAM*0.8)
+    double usage_ratio = memory_used*1.0 / MAX_RAM;
+
+    if (usage_ratio > EVICTION_LIMIT)
+        eviction_active = 1;
+
+    if (eviction_active == 1 && usage_ratio <= EVICTION_LIMIT - 0.2)
+        eviction_active = 0;
+        
+    if (eviction_active == 1)
     {
+        // printf("Memory Used: %d, Ratio: %f\n", memory_used, usage_ratio); fflush(stdout);
         HashEntry* entry = lru_cache.tail;
-        for (int i = 0; entry != NULL && i < 10; i++, 
+        for (int i = 0; entry != NULL && i < EVICTION_BATCH_SIZE; i++, 
                                 entry = entry->lru_prev)
         {
             if (entry->pending_eviction == 1)
@@ -724,7 +756,7 @@ void send_to_evict()
     }
 }
 
-void eviction(void* arg)
+void* eviction(void* arg)
 {
     EvictionMsg msg;
     EvictionResult result;
@@ -743,12 +775,34 @@ void eviction(void* arg)
 
 int write_to_swap(char* value, int len)
 {
-    int offset = global_file_end;
+    long long offset = global_file_end;
     global_file_end += len;
 
     pwrite(swap_fd, value, len, offset);
 
     return offset;
+}
+
+void check_expired()
+{
+    time_t now = time(NULL);
+    for (int i = 0; i < 20; i++)
+    {
+        current_check_expired = (current_check_expired + 1) % TABLE_SIZE;
+
+        HashEntry* it = hashmap[current_check_expired];
+        while (it != NULL)
+        {
+            HashEntry* next = it->nextEntry;
+
+            if (now > it->expiry_time)
+            {
+                printf("Elementul cu key %s a expirat\n", it->key); fflush(stdout);
+                del(it->key);
+            }
+            it = next;
+        }
+    }
 }
 
 int fd_write(int fd, const char *msg)

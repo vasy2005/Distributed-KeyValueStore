@@ -2,14 +2,14 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include <stddef.h>
+#include <stdio.h>
 
-#define TABLE_SIZE 1024
-#define SEED 1000000009
 //power of 2
 
 HashEntry** hashmap;
 LRUCache lru_cache;
-long long memory_used;
+long long memory_used = 0;
+long long global_version_counter = 0;
 
 //LRUCache
 void lru_init()
@@ -88,11 +88,11 @@ HashEntry* insert_in_hash(const char* key, const char* value, long long ttl)
                 memory_used -= it->value_len+1;
             }
             
-            it->ttl = ttl;
+            it->expiry_time = time(NULL) + ttl;
             it->storage.ram_value = strdup(value);
             it->value_len = strlen(value);
             it->is_swapped = 0;
-            it->version ++;
+            it->version = ++global_version_counter;
 
             memory_used += it->value_len+1;
             return it;
@@ -102,12 +102,13 @@ HashEntry* insert_in_hash(const char* key, const char* value, long long ttl)
     if (hashEntry == NULL)
         return NULL;
     
-    hashEntry->ttl = ttl;
+    hashEntry->expiry_time = time(NULL) + ttl;
     hashEntry->key = strdup(key);
     hashEntry->storage.ram_value = strdup(value);
     hashEntry->value_len = strlen(value);
-    hashEntry->version = 1;
+    hashEntry->version = ++global_version_counter;
     hashEntry->pending_eviction = 0;
+    hashEntry->is_swapped = 0;
 
     memory_used += strlen(hashEntry->key) + 1;
     memory_used += hashEntry->value_len + 1;
@@ -131,6 +132,11 @@ HashEntry* get_from_key(const char* key)
     for (HashEntry* it = hashmap[index]; it != NULL; it = it->nextEntry)
         if (strcmp(it->key, key) == 0)
         {
+            if (time(NULL) > it->expiry_time)
+            {
+                delete_from_hash(key);
+                return NULL;
+            }
             return it;
         }
 
