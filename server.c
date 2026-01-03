@@ -69,13 +69,15 @@ int fd_write(int, const char*);
 int fd_read(int, char*);
 int slave_setup(char*, int);
 const char* get_ip_from_fd(int);
-int execute_multi_commands(char [][MSG_LEN], int, int);
+int execute_multi_commands(int, char [][MSG_LEN], int, int);
+int atomic_get(int, const char*, char*);
 void strip_msg(char*);
 void get_from_disk(void *arg);
 void* eviction(void *arg);
 int write_to_swap(char*, int);
 void send_to_evict();
 void check_expired();
+int load_save_file();
 
 int PORT = 5000;
 int server_type = MASTER;
@@ -104,6 +106,8 @@ int eviction_active = 0;
 int current_check_expired = 0;
 
 int swap_fd;
+
+FILE* save_fd;
 
 typedef struct 
 {
@@ -146,6 +150,27 @@ typedef struct
     int version;
 } EvictionMsg;
 
+typedef enum
+{
+    NONE,
+    RESTORE_RAM,
+    RESTORE_DISK
+} UndoType;
+typedef struct
+{
+    char key[MSG_LEN];
+    UndoType type;
+
+    char* ram_value;
+    int value_len;
+
+    long long disk_offset;
+
+    long long expiry_time;
+    int version;
+} UndoLog;
+void create_undo_entry(UndoLog*, const char*);
+
 int global_file_end = 0;
 
 Client clients[FD_MAX];
@@ -177,6 +202,12 @@ int main(int argc, char *argv[])
         perror("Swap file couldn't be created / opened");
         exit(1);
     }
+
+    char save_file[MSG_LEN];
+    sprintf(save_file, "save_file_%d.txt", PORT);
+    if ((save_fd = fopen(save_file, "a+")) == NULL)
+        perror("Save file doesn't exists \\ couldn't be created");
+    
 
     if (pipe(disk_pipe) < 0)
     {
@@ -245,6 +276,8 @@ int main(int argc, char *argv[])
 
     nfds = sd;
 
+    if (load_save_file() < 0)
+        printf("Error while loading save file\n");
     printf("[server] Asteptam la portul %d...\n", PORT);
     fflush(stdout);
     
@@ -253,15 +286,14 @@ int main(int argc, char *argv[])
     while(1)
     {
         memcpy((char*)&readfds, (char*)&actfds, sizeof(readfds));
-        
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
         //TODO: use epoll
         if (select(nfds+1, &readfds, NULL, NULL, &tv) < 0)
         {
             perror("[server] Eroare la select().\n");
             return errno;
         }
-
-        //TODO: la fiecare secunda testez daca trebuie sters cnv, pe MASTER
 
         if (FD_ISSET(thread_to_main_evictpipe[0], &readfds))
         {
@@ -313,9 +345,7 @@ int main(int argc, char *argv[])
                 
                 fd_write(result.client_fd, entry->storage.ram_value);
 
-                FD_SET(result.client_fd, &actfds);
-
-                // TODO: what if entry was deleted in the meantime? 
+                FD_SET(result.client_fd, &actfds); 
             }
             else
                 {
@@ -327,8 +357,6 @@ int main(int argc, char *argv[])
 
         if (FD_ISSET(sd, &readfds))
         {
-
-            printf("am primit de la read\n");
             FD_CLR(sd, &readfds);
             len = sizeof(from);
             memset(&from, 0, sizeof(from));
@@ -445,7 +473,7 @@ int master_compute(int fd)
         else
             {
                 clients[fd].is_multi = 0;
-                if (execute_multi_commands(clients[fd].queue, clients[fd].st, clients[fd].dr) < 0)
+                if (execute_multi_commands(fd, clients[fd].queue, clients[fd].st, clients[fd].dr) < 0)
                     strcpy(ans, "[SERVER] ERROR, COMMANDS DISCARDED");
                 else
                     strcpy(ans, "[SERVER] COMMANDS EXECUTED SUCCESSFULLY");
@@ -541,10 +569,12 @@ int master_compute(int fd)
         if (set(key, value, ttl) == NULL)
             strcpy(ans, "[SERVER] SET FAILED");
         else
+        {
             strcpy(ans, "[SERVER] SET DONE SUCCESSFULLY");
 
-        for (int i = 0; i < slave_counter; i++)
-            fd_write(slaves[i].fd, msg);
+            for (int i = 0; i < slave_counter; i++)
+                fd_write(slaves[i].fd, msg);
+        }
 
         if (fd_write(fd, ans) < 0)
             return -1;
@@ -605,6 +635,8 @@ int slave_compute(int fd)
         return bytes;
     }
 
+
+
     char value[MSG_LEN]; long long ttl;
     if (sscanf(msg, "SET %s %s %lld", key, value, &ttl) == 3)
     {
@@ -657,6 +689,8 @@ int get(int fd, const char* key, char* value)
     if (entry == NULL)
         return -1;
 
+    // fprintf(save_fd, "GET %s %s\n", key, value);
+    
     if (entry->is_swapped == 0)
     {
         lru_promote(entry);
@@ -705,20 +739,217 @@ void get_from_disk(void *arg)
 HashEntry* set(const char* key, const char* value, long long ttl)
 {
     HashEntry* entry = insert_in_hash(key, value, ttl);
-    lru_promote(entry);
+    
+    if (entry != NULL)
+    {
+        lru_promote(entry);
+        fprintf(save_fd, "SET %s %s %lld\n", key, value, ttl); fflush(save_fd);
+    }
     return entry;
 }
 
 int del(const char* key)
 {
     delete_from_hash(key);
+    fprintf(save_fd, "DEL %s\n", key); fflush(save_fd);
     return 0; //-1 for error
 }
 
-int execute_multi_commands(char queue[][MSG_LEN], int st, int dr)
+int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
 {
+    UndoLog logs[100]; int index = 0;
+    char msgs[100][MSG_LEN]; int no_msg = 0;
     
-    return 0; //-1 for faiilure
+    int success = 1;
+    for (int i = st; i <= dr; i++)
+    {
+        success = 1;
+        char* msg = queue[st++];
+        char ans[MSG_LEN]; ans[0] = 0;
+        char key[MSG_LEN];
+        if (sscanf(msg, "GET %s", key) == 1)
+        {
+            ans[0] = 0;
+            char value[MSG_LEN];
+            int status = 0;
+            if ((status = atomic_get(fd, key, value)) < 0)
+            {
+                strcpy(ans, "[SERVER] GET FAILED");
+                success = 0;
+            }
+            else
+                strcpy(ans, value);
+                
+            if (ans[0] != 0 && fd_write(fd, ans) < 0)
+                success = 0;
+            if (success == 0)
+                break;
+            else
+                continue;
+        }
+
+        char value[MSG_LEN]; long long ttl;
+        if (sscanf(msg, "SET %s %s %lld", key, value, &ttl) == 3)
+        {   
+            strcpy(msgs[no_msg++], msg);
+            create_undo_entry(&logs[index++], key);
+
+            if (set(key, value, ttl) == NULL)
+            {
+                strcpy(ans, "[SERVER] SET FAILED");
+                success = 0;
+            }
+            else
+                strcpy(ans, "[SERVER] SET DONE SUCCESSFULLY");
+
+            if (fd_write(fd, ans) < 0)
+                success = 0;
+            if (success == 0)
+                break;
+            else
+                continue;
+        }
+
+        if (sscanf(msg, "DEL %s", key) == 1)
+        {
+            strcpy(msgs[no_msg++], msg);
+            create_undo_entry(&logs[index++], key);
+            if (del(key) < 0)
+            {
+                success = 0;
+                strcpy(ans, "[SERVER] DEL FAILED");
+            }
+            else
+                strcpy(ans, "[SERVER] DEL DONE SUCCESSFULLY");
+
+            if (fd_write(fd, ans) < 0)
+                success = 0;
+            if (success == 0)
+                break;
+            else
+                continue;
+        }
+
+        strcpy(ans, "[SERVER] UNKNOWN COMMAND");
+        fd_write(fd, ans);
+        success = 0;
+        break;
+    }
+
+    if (success == 0)
+    {
+        for (int i = index - 1; i >= 0; i--)
+        {
+            if (logs[i].type == NONE)
+            {
+                del(logs[i].key);
+                continue;
+            }
+
+            HashEntry* entry;
+            if (logs[i].type == RESTORE_RAM)
+                entry = set(logs[i].key, logs[i].ram_value, 100);
+            else
+                {
+                    entry = set(logs[i].key, "a", 100);
+                    free(entry->storage.ram_value); memory_used -= 2;
+                    entry->storage.disk_offset = logs[i].disk_offset;
+                    entry->is_swapped = 1;
+                }
+            
+            entry->expiry_time = logs[i].expiry_time;
+            entry->version = logs[i].version;
+            entry->value_len = logs[i].value_len;
+        }    
+
+        for (int i = index - 1; i >= 0; i--)
+            if (logs[i].type == RESTORE_RAM && logs[i].ram_value != NULL)
+                free(logs[i].ram_value);
+        return -1;
+    }
+
+    fprintf(save_fd, "MULTI\n");
+
+    for (int i = index - 1; i >= 0; i--)
+        if (logs[i].type == RESTORE_RAM && logs[i].ram_value != NULL)
+            free(logs[i].ram_value);
+
+    for (int i = 0; i < no_msg; i++)
+    {
+        fprintf(save_fd, "%s\n", msgs[i]);
+        for (int j = 0; j < slave_counter; j++)
+            if (strncmp(msgs[i], "GET", 3) != 0)
+                fd_write(slaves[j].fd, msgs[i]);
+    }
+    return 0;
+}
+
+void create_undo_entry(UndoLog* log, const char* key)
+{
+    HashEntry* entry = get_from_key(key);
+
+    if (entry == NULL)
+    {
+        log->type = NONE;
+        return;
+    }
+
+    if (entry->is_swapped == 0)
+    {
+        log->type = RESTORE_RAM;
+        log->ram_value = strdup(entry->storage.ram_value);
+    }
+    else
+        {
+            log->type=RESTORE_DISK;
+            log->disk_offset = entry->storage.disk_offset;
+        }
+
+    log->value_len = entry->value_len;
+    log->version = entry->version;
+    log->expiry_time = entry->expiry_time;
+    strcpy(log->key, entry->key);
+    
+}
+
+int atomic_get(int fd, const char* key, char* value)
+{
+    value[0] = 0;
+    HashEntry* entry = get_from_key(key);
+    if (entry == NULL)
+        return -1;
+
+    if (entry->is_swapped == 0)
+    {
+        lru_promote(entry);
+        strcpy(value, entry->storage.ram_value);
+    }
+    else
+        {
+            char* buffer = malloc(entry->value_len+1);
+            if (buffer == NULL)
+                return -1;
+
+            int bytes = pread(swap_fd, buffer, entry->value_len, entry->storage.disk_offset);
+            
+            if (bytes < 0)
+                return -1;
+
+            if (bytes > 0)
+                buffer[bytes] = 0;
+            else
+                buffer[0] = 0;
+
+            entry->storage.ram_value = buffer;
+            entry->is_swapped = 0;
+            memory_used += entry->value_len + 1;
+
+            printf("[server] Resursa cu cheia %s luata de pe swap file.\n", entry->key);
+
+            lru_promote(entry);
+        }
+
+    return 0;
 }
 
 void send_to_evict()
@@ -767,6 +998,8 @@ void* eviction(void* arg)
             result.offset = write_to_swap(msg.value, msg.len);
             result.key[0] = 0; strcpy(result.key, msg.key);
             result.version = msg.version;
+
+            free(msg.value);
 
             write(thread_to_main_evictpipe[1], &result, sizeof(EvictionResult));
         }
@@ -858,4 +1091,31 @@ void strip_msg(char* msg)
     int i;
     for (i = 0; msg[i] != 0 && msg[i] != '\n'; i++);    
     msg[i] = 0;
+}
+
+int load_save_file()
+{
+    char msg[MSG_LEN];
+    while (fgets(msg, MSG_LEN, save_fd) != NULL)
+    {
+        strip_msg(msg);
+
+        char key[MSG_LEN], value[MSG_LEN]; long long ttl;
+        if (sscanf(msg, "SET %s %s %lld", key, value, &ttl) == 3)
+        {
+            HashEntry* entry = insert_in_hash(key, value, ttl);
+    
+            if (entry != NULL)
+                lru_promote(entry);
+            else
+                return -1;
+            continue;
+        }
+
+        if (sscanf(msg, "DEL %s", key) == 1)
+            delete_from_hash(key);
+    }
+
+    printf("Finished loading saved database.");
+    return 0;
 }
