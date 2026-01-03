@@ -52,7 +52,6 @@ int main(int argc, char *argv[])
     nfds = master_fd;
     
     memset(msg, 0, sizeof(msg));
-    printf("> "); fflush(stdout);
     while(1)
     {
         
@@ -76,7 +75,7 @@ int main(int argc, char *argv[])
                 slave_fd = -1;
             }
             else
-            printf("%s\n> ", msg), fflush(stdout);
+            printf("%s\n", msg), fflush(stdout);
             continue;
         }
 
@@ -109,7 +108,7 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            printf("%s\n> ", msg); fflush(stdout);
+            printf("%s\n", msg); fflush(stdout);
             continue;
         }
 

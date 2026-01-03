@@ -144,7 +144,7 @@ HashEntry* get_from_key(const char* key)
     return NULL;
 }
 
-void delete_from_hash(const char* key)
+int delete_from_hash(const char* key)
 {
     long long index = get_hash_from_key(key);
     for (HashEntry* it = hashmap[index]; it != NULL; it = it->nextEntry)
@@ -171,6 +171,7 @@ void delete_from_hash(const char* key)
 
 
             free(it);
-            break;
+            return 0;
         }
+    return -1;
 }

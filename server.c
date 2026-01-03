@@ -54,6 +54,7 @@ typedef struct
 
 typedef struct 
 {
+    int is_client; //slaves are also treated as clients
     int active;
     int is_multi; //for MULTI
     char queue[QUEUE_LEN][MSG_LEN]; int st, dr;//for MULTI
@@ -317,13 +318,10 @@ int main(int argc, char *argv[])
                 
                 printf("[server] Resursa cu cheia %s evacuata pe swap file\n", entry->key);
             }
-            else
-                printf("[server] linia 281\n");
         }
 
         if (FD_ISSET(disk_pipe[0], &readfds))
         {
-            printf("am primit de la disk read thread\n");
             FD_CLR(disk_pipe[0], &readfds);
             DiskJobResult result;
             read(disk_pipe[0], &result, sizeof(DiskJobResult));
@@ -366,6 +364,7 @@ int main(int argc, char *argv[])
             clients[client].active = 1;
             clients[client].is_multi = 0;
             clients[client].st = 0; clients[client].dr = -1;
+            clients[client].is_client = 1;
 
             if (client < 0)
             {
@@ -378,7 +377,7 @@ int main(int argc, char *argv[])
 
             FD_SET(client, &actfds);
 
-            printf("[server] S-a conectat clientul cu descriptorul %d, de la adresa %s.\n", client, conv_addr(from));
+            printf("[server] S-a conectat client/slave cu descriptorul %d, de la adresa %s.\n", client, conv_addr(from));
             fflush(stdout);
         }
 
@@ -460,8 +459,8 @@ int master_compute(int fd)
         if (clients[fd].is_multi == 1)
             strcpy(ans, "[SERVER] MULTI MODE IS ALREADY SET");
         else
-            clients[fd].is_multi = 1, strcpy(ans, "[SERVER] MULTI MODE SET");
-        if (fd_write(fd, ans) < 0)
+            clients[fd].is_multi = 1;
+        if (ans[0] != 0 && fd_write(fd, ans) < 0)
             return -1;
         return bytes;
     }
@@ -511,6 +510,7 @@ int master_compute(int fd)
 
     if (sscanf(msg, "SLAVE %d", &slaves[slave_counter].port) == 1)
     {
+        clients[fd].is_client = 0;
         slaves[slave_counter].fd = fd;
         slaves[slave_counter].client_counter = 0;
         const char *ip = get_ip_from_fd(fd);
@@ -570,13 +570,15 @@ int master_compute(int fd)
             strcpy(ans, "[SERVER] SET FAILED");
         else
         {
-            strcpy(ans, "[SERVER] SET DONE SUCCESSFULLY");
-
             for (int i = 0; i < slave_counter; i++)
                 fd_write(slaves[i].fd, msg);
+            
+            char notif[MSG_LEN]; notif[0] = 0;
+            sprintf(notif, "Key %s set to Value %s with TTL %lld by client with file descriptor %d", key, value, ttl, fd);
+            notify_clients(notif);
         }
 
-        if (fd_write(fd, ans) < 0)
+        if (ans[0] > 0 && fd_write(fd, ans) < 0)
             return -1;
         return bytes;
     }
@@ -586,12 +588,14 @@ int master_compute(int fd)
         if (del(key) < 0)
             strcpy(ans, "[SERVER] DEL FAILED");
         else
-            strcpy(ans, "[SERVER] DEL DONE SUCCESSFULLY");
-
-        for (int i = 0; i < slave_counter; i++)
-            fd_write(slaves[i].fd, msg);
-
-        if (fd_write(fd, ans) < 0)
+            {
+                for (int i = 0; i < slave_counter; i++)
+                    fd_write(slaves[i].fd, msg);
+                char notif[MSG_LEN]; notif[0] = 0;
+                sprintf(notif, "Key %s deleted by client with file descriptor %d", key, fd);
+                notify_clients(notif); 
+            }
+        if (ans[0] > 0 && fd_write(fd, ans) < 0)
             return -1;
         return bytes;
     }
@@ -642,8 +646,6 @@ int slave_compute(int fd)
     {
         if (set(key, value, ttl) == NULL)
             strcpy(ans, "[server] SET FAILED.\n");
-        else
-            strcpy(ans, "[server] SET DONE SUCCESSFULLY.\n");
 
         printf("%s\n", ans); fflush(stdout);
         return bytes;
@@ -653,8 +655,6 @@ int slave_compute(int fd)
     {
         if (del(key) < 0)
             strcpy(ans, "[SERVER] DEL FAILED");
-        else
-            strcpy(ans, "[SERVER] DEL DONE SUCCESSFULLY");
 
         printf("%s\n", ans); fflush(stdout);
         return bytes;
@@ -689,8 +689,6 @@ int get(int fd, const char* key, char* value)
     if (entry == NULL)
         return -1;
 
-    // fprintf(save_fd, "GET %s %s\n", key, value);
-    
     if (entry->is_swapped == 0)
     {
         lru_promote(entry);
@@ -750,7 +748,8 @@ HashEntry* set(const char* key, const char* value, long long ttl)
 
 int del(const char* key)
 {
-    delete_from_hash(key);
+    if (delete_from_hash(key) < 0)
+        return -1;
     fprintf(save_fd, "DEL %s\n", key); fflush(save_fd);
     return 0; //-1 for error
 }
@@ -799,10 +798,8 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
                 strcpy(ans, "[SERVER] SET FAILED");
                 success = 0;
             }
-            else
-                strcpy(ans, "[SERVER] SET DONE SUCCESSFULLY");
 
-            if (fd_write(fd, ans) < 0)
+            if (ans[0] > 0 && fd_write(fd, ans) < 0)
                 success = 0;
             if (success == 0)
                 break;
@@ -848,16 +845,15 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
 
             HashEntry* entry;
             if (logs[i].type == RESTORE_RAM)
-                entry = set(logs[i].key, logs[i].ram_value, 100);
+                entry = set(logs[i].key, logs[i].ram_value, logs[i].expiry_time);
             else
                 {
-                    entry = set(logs[i].key, "a", 100);
+                    entry = set(logs[i].key, "a", logs[i].expiry_time);
                     free(entry->storage.ram_value); memory_used -= 2;
                     entry->storage.disk_offset = logs[i].disk_offset;
                     entry->is_swapped = 1;
                 }
             
-            entry->expiry_time = logs[i].expiry_time;
             entry->version = logs[i].version;
             entry->value_len = logs[i].value_len;
         }    
@@ -876,7 +872,6 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
 
     for (int i = 0; i < no_msg; i++)
     {
-        fprintf(save_fd, "%s\n", msgs[i]);
         for (int j = 0; j < slave_counter; j++)
             if (strncmp(msgs[i], "GET", 3) != 0)
                 fd_write(slaves[j].fd, msgs[i]);
@@ -891,8 +886,15 @@ void create_undo_entry(UndoLog* log, const char* key)
     if (entry == NULL)
     {
         log->type = NONE;
+        strcpy(log->key, key);
         return;
     }
+
+    log->value_len = entry->value_len;
+    log->version = entry->version;
+    log->expiry_time = entry->expiry_time - time(NULL);
+
+    strcpy(log->key, entry->key);
 
     if (entry->is_swapped == 0)
     {
@@ -904,12 +906,6 @@ void create_undo_entry(UndoLog* log, const char* key)
             log->type=RESTORE_DISK;
             log->disk_offset = entry->storage.disk_offset;
         }
-
-    log->value_len = entry->value_len;
-    log->version = entry->version;
-    log->expiry_time = entry->expiry_time;
-    strcpy(log->key, entry->key);
-    
 }
 
 int atomic_get(int fd, const char* key, char* value)
@@ -1031,6 +1027,13 @@ void check_expired()
             if (now > it->expiry_time)
             {
                 printf("Elementul cu key %s a expirat\n", it->key); fflush(stdout);
+                
+                if (server_type == MASTER)
+                {
+                    char notif[MSG_LEN]; notif[0] = 0;
+                    sprintf(notif, "Key %s has expired and has been deleted.", it->key);
+                    notify_clients(notif);
+                }
                 del(it->key);
             }
             it = next;
@@ -1067,10 +1070,15 @@ int fd_read(int fd, char* msg)
         perror("[server] Eroare la read() lungime mesaj de la client.\n");
         return bytes;
     }
+
+    if (msg_len > MSG_LEN-1)
+        msg_len = MSG_LEN-1;
     
     bytes = read(fd, msg, msg_len);
     if (bytes < 0)
         perror("[server] Eroare la read() mesaj de la client.\n");
+    else
+        msg[bytes] = 0;
 
     return bytes;
 }
@@ -1091,6 +1099,13 @@ void strip_msg(char* msg)
     int i;
     for (i = 0; msg[i] != 0 && msg[i] != '\n'; i++);    
     msg[i] = 0;
+}
+
+void notify_clients(const char* msg)
+{
+    for (int i = 0; i < FD_MAX; i++)
+        if (clients[i].active == 1 && clients[i].is_client == 1)
+            fd_write(i, msg);
 }
 
 int load_save_file()
@@ -1116,6 +1131,6 @@ int load_save_file()
             delete_from_hash(key);
     }
 
-    printf("Finished loading saved database.");
+    printf("Finished loading saved database.\n"); fflush(stdout);
     return 0;
 }

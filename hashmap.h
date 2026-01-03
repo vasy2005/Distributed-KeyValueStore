@@ -44,7 +44,7 @@ extern long long memory_used;
 HashEntry** create_hashmap();
 HashEntry* insert_in_hash(const char* key, const char* value, long long ttl);
 HashEntry* get_from_key(const char* key);
-void delete_from_hash(const char* key);
+int delete_from_hash(const char* key);
 
 void lru_init();
 void lru_promote(HashEntry* entry);
