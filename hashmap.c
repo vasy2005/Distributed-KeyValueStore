@@ -135,7 +135,7 @@ HashEntry* get_from_key(const char* key)
             if (time(NULL) > it->expiry_time)
             {
                 delete_from_hash(key);
-                printf("Elementul cu key %s a expirat\n", it->key); fflush(stdout);
+                printf("Elementul cu key %s a expirat\n", key); fflush(stdout);
                 return NULL;
             }
             return it;

@@ -12,6 +12,14 @@
 #define MSG_LEN 1000
 #define STDIN 0
 
+#define COL_RESET   "\x1b[0m"
+#define COL_RED     "\x1b[31m"     
+#define COL_GREEN   "\x1b[32m"    
+#define COL_YELLOW  "\x1b[33m"     
+#define COL_BLUE    "\x1b[34m"    
+#define COL_CYAN    "\x1b[36m"    
+#define COL_MAGENTA "\x1b[35m"     
+
 extern int errno;
 
 int port;
@@ -22,10 +30,13 @@ int slave_fd = -1;
 char ip_slave[16]; int port_slave;
 int is_multi = 0;
 
+char prompt[MSG_LEN];
+
 int fd_write(int, const char*);
 int fd_read(int, char*);
 int connect_to_server(const char*, int);
-void strip_msg(char* msg);
+void strip_msg(char*);
+void print_colored_message(char*);
 
 int main(int argc, char *argv[])
 {
@@ -51,14 +62,21 @@ int main(int argc, char *argv[])
     tv.tv_sec = 1000; tv.tv_usec = 0; //TODO: add client timeout
     nfds = master_fd;
     
+    sprintf(prompt, "%skv-store> %s", COL_CYAN, COL_RESET);
+    printf("%s=== Client Pornit. Scrie comenzi (GET, SET, DEL...) ===%s\n", COL_GREEN, COL_RESET);
+
+    printf("%s", prompt); fflush(stdout);
     memset(msg, 0, sizeof(msg));
     while(1)
     {
-        
         memcpy(&readfds, &actfds, sizeof(readfds));
         memset(msg, 0, MSG_LEN);
-        
-        if (select(nfds+1, &readfds, NULL, NULL, NULL) < 0)
+
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        if (select(nfds+1, &readfds, NULL, NULL, &tv) < 0)
         {
             perror ("[client] Eroare la select().\n");
             return errno;
@@ -70,12 +88,12 @@ int main(int argc, char *argv[])
         {
             if (fd_read(slave_fd, msg) <= 0)
             {
-                printf("[client] Slave a inchis conexiunea.\n"); fflush(stdout);
+                print_colored_message("[client] Slave a inchis conexiunea.\n");
                 close(slave_fd); FD_CLR(slave_fd, &actfds);
                 slave_fd = -1;
             }
             else
-            printf("%s\n", msg), fflush(stdout);
+                print_colored_message(msg);
             continue;
         }
 
@@ -83,7 +101,7 @@ int main(int argc, char *argv[])
         {
             if (fd_read(master_fd, msg) <= 0)
             {
-                printf("[client] Master a inchis conexiunea.\n"); fflush(stdout);
+                printf("\n%s[client] Master a inchis conexiunea.%s\n", COL_RED, COL_RESET); fflush(stdout);
                 close(master_fd);
                 exit(0);
             }
@@ -92,58 +110,85 @@ int main(int argc, char *argv[])
             char comm[MSG_LEN];
             if (sscanf(msg, "CONN %s %d %[^\n]", ip, &port, comm) == 3)
             {
-                printf("[client] Primit CONN catre Slave %s:%d...\n", ip, port);
-
+                char mesaj[MSG_LEN]; mesaj[0] = 0;
+                sprintf(mesaj, "[client] Primit CONN catre Slave %s:%d...\n", ip, port);
+                print_colored_message(mesaj);
                 slave_fd = connect_to_server(ip, port);
                 FD_SET(slave_fd, &actfds);
                 if (nfds < slave_fd)
                     nfds = slave_fd;
                     
-                    strcpy(msg, comm);
-                    if (fd_write(slave_fd, msg) < 0)
-                    {
+                strcpy(msg, comm);
+                if (fd_write(slave_fd, msg) < 0)
+                {
                     perror ("[client] Eroare la write() spre server.\n");
                     return errno;
                 }
                 continue;
             }
 
-            printf("%s\n", msg); fflush(stdout);
+            print_colored_message(msg);
             continue;
         }
+
 
         if (FD_ISSET(STDIN, &readfds))
         {
             int bytes = read(0, msg, MSG_LEN);
             strip_msg(msg);
-
-            int crt_fd;
-            if (slave_fd >= 0)
-                crt_fd = slave_fd;
-            else
-                crt_fd = master_fd;
-
-            // Always send these to master
-            if (strncmp(msg, "SET", 3) == 0 || strncmp(msg, "DEL", 3) == 0)
-                crt_fd = master_fd;
-            if (strcmp(msg, "MULTI") == 0)
-                is_multi = 1;
-
-            if (is_multi == 1)
-                crt_fd = master_fd;
-
-            if (strcmp(msg, "DISCARD") == 0 || strcmp(msg, "EXECUTE") == 0)
-                is_multi = 0;
-
-            if (fd_write(crt_fd, msg) < 0)
+            if (msg != NULL && msg[0] != 0)
             {
-                perror ("[client] Eroare la write() spre server.\n");
-                return errno;
+                int crt_fd;
+                if (slave_fd >= 0)
+                    crt_fd = slave_fd;
+                else
+                    crt_fd = master_fd;
+
+                // Always send these to master
+                if (strncmp(msg, "SET", 3) == 0 || strncmp(msg, "DEL", 3) == 0)
+                    crt_fd = master_fd;
+                if (strcmp(msg, "MULTI") == 0)
+                    is_multi = 1;
+
+                if (is_multi == 1)
+                    crt_fd = master_fd;
+
+                if (strcmp(msg, "DISCARD") == 0 || strcmp(msg, "EXECUTE") == 0)
+                    is_multi = 0;
+
+                if (fd_write(crt_fd, msg) < 0)
+                {
+                    perror ("[client] Eroare la write() spre server.\n");
+                    return errno;
+                }
             }
+
+            printf("%s", prompt); fflush(stdout);
         }
+
+        
     }
 
     close(master_fd);
+}
+
+void print_colored_message(char* msg)
+{
+    printf("\r\x1b[K");
+
+    if (strstr(msg, "[FAILED]") || strstr(msg, "[ERROR]"))
+        printf("%s %s%s", COL_RED, msg, COL_RESET);
+    else
+    if (strstr(msg, "[SUCCESS]") || strstr(msg, "[DONE]"))
+        printf("%s %s%s", COL_GREEN, msg, COL_RESET);
+    else
+    if (strstr(msg, "[NOTIFY]"))
+        printf("%s %s%s", COL_YELLOW, msg, COL_RESET);
+    else
+        printf("%s %s%s \n", COL_BLUE, msg, COL_RESET);
+
+    printf("%s", prompt);
+    fflush(stdout);
 }
 
 void strip_msg(char* msg)

@@ -28,6 +28,15 @@
 #define EVICTION_LIMIT 0.9f
 #define EVICTION_BATCH_SIZE 20
 
+#define COLOR_RED     "\x1b[31m"
+#define COLOR_GREEN   "\x1b[32m"
+#define COLOR_YELLOW  "\x1b[33m"
+#define COLOR_BLUE    "\x1b[34m"
+#define COLOR_MAGENTA "\x1b[35m"
+#define COLOR_CYAN    "\x1b[36m"
+#define COLOR_BOLD    "\x1b[1m"
+#define COLOR_RESET   "\x1b[0m"
+
 extern int errno;
 
 char * conv_addr (struct sockaddr_in address)
@@ -272,8 +281,8 @@ int main(int argc, char *argv[])
     FD_SET(disk_pipe[0], &actfds);
     FD_SET(thread_to_main_evictpipe[0], &actfds);
 
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
 
     nfds = sd;
 
@@ -287,8 +296,8 @@ int main(int argc, char *argv[])
     while(1)
     {
         memcpy((char*)&readfds, (char*)&actfds, sizeof(readfds));
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
         //TODO: use epoll
         if (select(nfds+1, &readfds, NULL, NULL, &tv) < 0)
         {
@@ -348,7 +357,7 @@ int main(int argc, char *argv[])
             else
                 {
                     free(result.value);
-                    fd_write(result.client_fd, "GET FAILED");
+                    fd_write(result.client_fd, "[ERROR] GET FAILED\n");
                 }
             free(result.key);
         }
@@ -408,8 +417,8 @@ int main(int argc, char *argv[])
 
             }    
             
-        send_to_evict();
         check_expired();
+        send_to_evict();
     }
 }
 
@@ -457,7 +466,7 @@ int master_compute(int fd)
     if (strcmp(msg, "MULTI") == 0)
     {
         if (clients[fd].is_multi == 1)
-            strcpy(ans, "[SERVER] MULTI MODE IS ALREADY SET");
+            strcpy(ans, "[ERROR] MULTI MODE IS ALREADY SET\n");
         else
             clients[fd].is_multi = 1;
         if (ans[0] != 0 && fd_write(fd, ans) < 0)
@@ -468,14 +477,14 @@ int master_compute(int fd)
     if (strcmp(msg, "EXECUTE") == 0)
     {
         if (clients[fd].is_multi == 0)
-            strcpy(ans, "MULTI MODE NOT ACTIVATED, THERE IS NOTHING TO EXECUTE");
+            strcpy(ans, "[ERROR] MULTI MODE NOT ACTIVATED, THERE IS NOTHING TO EXECUTE\n");
         else
             {
                 clients[fd].is_multi = 0;
                 if (execute_multi_commands(fd, clients[fd].queue, clients[fd].st, clients[fd].dr) < 0)
-                    strcpy(ans, "[SERVER] ERROR, COMMANDS DISCARDED");
+                    strcpy(ans, "[ERROR] COMMANDS DISCARDED\n");
                 else
-                    strcpy(ans, "[SERVER] COMMANDS EXECUTED SUCCESSFULLY");
+                    strcpy(ans, "[SUCCESS] COMMANDS EXECUTED SUCCESSFULLY\n");
                 clients[fd].st = 0; clients[fd].dr = -1;
             }
         
@@ -487,13 +496,13 @@ int master_compute(int fd)
     if (strcmp(msg, "DISCARD") == 0)
     {
         if (clients[fd].is_multi == 0)
-            strcpy(ans, "[SERVER] MULTI MODE NOT ACTIVATED, THERE IS NOTHING TO DISCARD");
+            strcpy(ans, "[ERROR] MULTI MODE NOT ACTIVATED, THERE IS NOTHING TO DISCARD\n");
         else
             {
                 clients[fd].is_multi = 0;
                 clients[fd].st = 0;
                 clients[fd].dr = -1;
-                strcpy(ans, "[SERVER] COMMANDS DISCARDED");
+                strcpy(ans, "[ERROR] COMMANDS DISCARDED\n");
             }
         
         if (fd_write(fd, ans) < 0)
@@ -535,7 +544,7 @@ int master_compute(int fd)
             char value[MSG_LEN];
             int status = 0;
             if ((status = get(fd, key, value)) < 0)
-                strcpy(ans, "[SERVER] GET FAILED");
+                strcpy(ans, "[ERROR] GET FAILED\n");
             else
                 if (status > 0)
                     strcpy(ans, value);
@@ -567,14 +576,14 @@ int master_compute(int fd)
     if (sscanf(msg, "SET %s %s %lld", key, value, &ttl) == 3)
     {
         if (set(key, value, ttl) == NULL)
-            strcpy(ans, "[SERVER] SET FAILED");
+            strcpy(ans, "[ERROR] SET FAILED\n");
         else
         {
             for (int i = 0; i < slave_counter; i++)
                 fd_write(slaves[i].fd, msg);
             
             char notif[MSG_LEN]; notif[0] = 0;
-            sprintf(notif, "Key %s set to Value %s with TTL %lld by client with file descriptor %d", key, value, ttl, fd);
+            sprintf(notif, "[NOTIFY] Key %s set to Value %s with TTL %lld by client with file descriptor %d\n", key, value, ttl, fd);
             notify_clients(notif);
         }
 
@@ -586,13 +595,13 @@ int master_compute(int fd)
     if (sscanf(msg, "DEL %s", key) == 1)
     {
         if (del(key) < 0)
-            strcpy(ans, "[SERVER] DEL FAILED");
+            strcpy(ans, "[ERROR] DEL FAILED\n");
         else
             {
                 for (int i = 0; i < slave_counter; i++)
                     fd_write(slaves[i].fd, msg);
                 char notif[MSG_LEN]; notif[0] = 0;
-                sprintf(notif, "Key %s deleted by client with file descriptor %d", key, fd);
+                sprintf(notif, "[NOTIFY] Key %s deleted by client with file descriptor %d\n", key, fd);
                 notify_clients(notif); 
             }
         if (ans[0] > 0 && fd_write(fd, ans) < 0)
@@ -600,7 +609,7 @@ int master_compute(int fd)
         return bytes;
     }
 
-    strcpy(ans, "[SERVER] UNKNOWN COMMAND");
+    strcpy(ans, "[ERROR] UNKNOWN COMMAND\n");
     if (fd_write(fd, ans) <= 0)
         return -1;
 
@@ -627,7 +636,7 @@ int slave_compute(int fd)
         char value[MSG_LEN];
         int status = 0;
         if ((status = get(fd, key, value)) < 0)
-            strcpy(ans, "[SERVER] GET FAILED");
+            strcpy(ans, "[ERROR] GET FAILED\n");
         else
             if (status > 0)
                 strcpy(ans, value);
@@ -645,7 +654,7 @@ int slave_compute(int fd)
     if (sscanf(msg, "SET %s %s %lld", key, value, &ttl) == 3)
     {
         if (set(key, value, ttl) == NULL)
-            strcpy(ans, "[server] SET FAILED.\n");
+            strcpy(ans, "[ERROR] SET FAILED.\n");
 
         printf("%s\n", ans); fflush(stdout);
         return bytes;
@@ -654,14 +663,14 @@ int slave_compute(int fd)
     if (sscanf(msg, "DEL %s", key) == 1)
     {
         if (del(key) < 0)
-            strcpy(ans, "[SERVER] DEL FAILED");
+            strcpy(ans, "[ERROR] DEL FAILED\n");
 
         printf("%s\n", ans); fflush(stdout);
         return bytes;
     }
 
     if (fd != fd_master)
-        strcpy(ans, "[SERVER] UNKNOWN COMMAND");
+        strcpy(ans, "[ERROR] UNKNOWN COMMAND\n");
     if (fd_write(fd, ans) <= 0)
         return -1;
     return bytes;
@@ -748,9 +757,9 @@ HashEntry* set(const char* key, const char* value, long long ttl)
 
 int del(const char* key)
 {
+    fprintf(save_fd, "DEL %s\n", key); fflush(save_fd);
     if (delete_from_hash(key) < 0)
         return -1;
-    fprintf(save_fd, "DEL %s\n", key); fflush(save_fd);
     return 0; //-1 for error
 }
 
@@ -773,7 +782,7 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
             int status = 0;
             if ((status = atomic_get(fd, key, value)) < 0)
             {
-                strcpy(ans, "[SERVER] GET FAILED");
+                strcpy(ans, "[ERROR] GET FAILED\n");
                 success = 0;
             }
             else
@@ -795,7 +804,7 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
 
             if (set(key, value, ttl) == NULL)
             {
-                strcpy(ans, "[SERVER] SET FAILED");
+                strcpy(ans, "[ERROR] SET FAILED\n");
                 success = 0;
             }
 
@@ -814,10 +823,10 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
             if (del(key) < 0)
             {
                 success = 0;
-                strcpy(ans, "[SERVER] DEL FAILED");
+                strcpy(ans, "[ERROR] DEL FAILED\n");
             }
             else
-                strcpy(ans, "[SERVER] DEL DONE SUCCESSFULLY");
+                strcpy(ans, "[SUCCESS] DEL DONE SUCCESSFULLY\n");
 
             if (fd_write(fd, ans) < 0)
                 success = 0;
@@ -827,7 +836,7 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
                 continue;
         }
 
-        strcpy(ans, "[SERVER] UNKNOWN COMMAND");
+        strcpy(ans, "[SERVER] UNKNOWN COMMAND\n");
         fd_write(fd, ans);
         success = 0;
         break;
@@ -1015,7 +1024,7 @@ int write_to_swap(char* value, int len)
 void check_expired()
 {
     time_t now = time(NULL);
-    for (int i = 0; i < 20; i++)
+    for (int i = 0; i < 100; i++)
     {
         current_check_expired = (current_check_expired + 1) % TABLE_SIZE;
 
@@ -1031,7 +1040,7 @@ void check_expired()
                 if (server_type == MASTER)
                 {
                     char notif[MSG_LEN]; notif[0] = 0;
-                    sprintf(notif, "Key %s has expired and has been deleted.", it->key);
+                    sprintf(notif, "[NOTIFY] Key %s has expired and has been deleted.\n", it->key);
                     notify_clients(notif);
                 }
                 del(it->key);
