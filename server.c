@@ -11,20 +11,19 @@
 #include <string.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <ctype.h>
 
 #include "thpool.h"
 #include "hashmap.h"
 
-//TODO SLAVE: la reconexiune, isi pierde baza de date
-
 #define MASTER 0
 #define SLAVE 1
-#define MSG_LEN 1000 //TODO: Could be buffer overflow
+#define MSG_LEN 1000 
 #define MAX_SLAVES 10
 #define QUEUE_LEN 100
 #define FD_MAX 1024
 #define READ_WORKERS 8
-#define MAX_RAM 300LL
+#define MAX_RAM 104857600LL //100MB
 #define EVICTION_LIMIT 0.9f
 #define EVICTION_BATCH_SIZE 20
 
@@ -88,6 +87,7 @@ int write_to_swap(char*, int);
 void send_to_evict();
 void check_expired();
 int load_save_file();
+void notify_clients(const char*);
 
 int PORT = 5000;
 int server_type = MASTER;
@@ -298,7 +298,7 @@ int main(int argc, char *argv[])
         memcpy((char*)&readfds, (char*)&actfds, sizeof(readfds));
         tv.tv_sec = 0;
         tv.tv_usec = 100000;
-        //TODO: use epoll
+        
         if (select(nfds+1, &readfds, NULL, NULL, &tv) < 0)
         {
             perror("[server] Eroare la select().\n");
@@ -460,6 +460,9 @@ int master_compute(int fd)
     if (bytes <= 0)
         return bytes;
     strip_msg(msg);
+
+    for (int i = 0; msg[i] != ' ' && msg[i] != 0; i++)
+        msg[i] = toupper(msg[i]);
     
     printf ("[server] Mesajul a fost receptionat...%s\n", msg);
 
@@ -564,7 +567,7 @@ int master_compute(int fd)
                 mini = i;
             }
 
-        sprintf(ans, "CONN %s %d GET %s", slaves[mini].ip, slaves[mini].port, key);
+        snprintf(ans, MSG_LEN*2, "CONN %s %d GET %s", slaves[mini].ip, slaves[mini].port, key);
         slaves[mini].client_counter ++;
         
         if (fd_write(fd, ans) < 0)
@@ -582,8 +585,8 @@ int master_compute(int fd)
             for (int i = 0; i < slave_counter; i++)
                 fd_write(slaves[i].fd, msg);
             
-            char notif[MSG_LEN]; notif[0] = 0;
-            sprintf(notif, "[NOTIFY] Key %s set to Value %s with TTL %lld by client with file descriptor %d\n", key, value, ttl, fd);
+            char notif[MSG_LEN*3]; notif[0] = 0;
+            snprintf(notif, sizeof(notif), "[NOTIFY] Key %s set to Value %s with TTL %lld by client with file descriptor %d\n", key, value, ttl, fd);
             notify_clients(notif);
         }
 
@@ -600,8 +603,8 @@ int master_compute(int fd)
             {
                 for (int i = 0; i < slave_counter; i++)
                     fd_write(slaves[i].fd, msg);
-                char notif[MSG_LEN]; notif[0] = 0;
-                sprintf(notif, "[NOTIFY] Key %s deleted by client with file descriptor %d\n", key, fd);
+                char notif[MSG_LEN*2]; notif[0] = 0;
+                snprintf(notif, sizeof(notif), "[NOTIFY] Key %s deleted by client with file descriptor %d\n", key, fd);
                 notify_clients(notif); 
             }
         if (ans[0] > 0 && fd_write(fd, ans) < 0)
@@ -626,6 +629,11 @@ int slave_compute(int fd)
     bytes = fd_read(fd, msg);
     if (bytes <= 0)
         return bytes;
+
+    strip_msg(msg);
+
+    for (int i = 0; msg[i] != ' ' && msg[i] != 0; i++)
+        msg[i] = toupper(msg[i]);
 
     printf ("[server] Mesajul a fost receptionat...%s\n", msg);
 
@@ -760,7 +768,7 @@ int del(const char* key)
     fprintf(save_fd, "DEL %s\n", key); fflush(save_fd);
     if (delete_from_hash(key) < 0)
         return -1;
-    return 0; //-1 for error
+    return 0; 
 }
 
 int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
@@ -969,7 +977,7 @@ void send_to_evict()
         
     if (eviction_active == 1)
     {
-        // printf("Memory Used: %d, Ratio: %f\n", memory_used, usage_ratio); fflush(stdout);
+        
         HashEntry* entry = lru_cache.tail;
         for (int i = 0; entry != NULL && i < EVICTION_BATCH_SIZE; i++, 
                                 entry = entry->lru_prev)

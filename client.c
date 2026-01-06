@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #define MSG_LEN 1000
 #define STDIN 0
@@ -136,6 +137,10 @@ int main(int argc, char *argv[])
         {
             int bytes = read(0, msg, MSG_LEN);
             strip_msg(msg);
+
+            for (int i = 0; msg[i] != ' ' && msg[i] != 0; i++)
+                msg[i] = toupper(msg[i]);
+
             if (msg != NULL && msg[0] != 0)
             {
                 int crt_fd;
