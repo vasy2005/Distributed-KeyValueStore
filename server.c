@@ -87,6 +87,7 @@ int write_to_swap(char*, int);
 void send_to_evict();
 void check_expired();
 int load_save_file();
+void* save_to_file(void*);
 void notify_clients(const char*);
 
 int PORT = 5000;
@@ -181,6 +182,9 @@ typedef struct
 } UndoLog;
 void create_undo_entry(UndoLog*, const char*);
 
+Thread save_thread;
+int main_to_savepipe[2];
+
 int global_file_end = 0;
 
 Client clients[FD_MAX];
@@ -217,7 +221,13 @@ int main(int argc, char *argv[])
     sprintf(save_file, "save_file_%d.txt", PORT);
     if ((save_fd = fopen(save_file, "a+")) == NULL)
         perror("Save file doesn't exists \\ couldn't be created");
-    
+
+    if (pipe(main_to_savepipe) < 0)
+    {
+        perror("Pipe couldn't be created.");
+        exit(1);
+    }
+    pthread_create(&save_thread.idThread, NULL, save_to_file, NULL);
 
     if (pipe(disk_pipe) < 0)
     {
@@ -505,7 +515,7 @@ int master_compute(int fd)
                 clients[fd].is_multi = 0;
                 clients[fd].st = 0;
                 clients[fd].dr = -1;
-                strcpy(ans, "[ERROR] COMMANDS DISCARDED\n");
+                strcpy(ans, "[SUCCESS] COMMANDS DISCARDED\n");
             }
         
         if (fd_write(fd, ans) < 0)
@@ -758,14 +768,19 @@ HashEntry* set(const char* key, const char* value, long long ttl)
     if (entry != NULL)
     {
         lru_promote(entry);
-        fprintf(save_fd, "SET %s %s %lld\n", key, value, ttl); fflush(save_fd);
+
+        char msg[MSG_LEN]; msg[0] = 0;
+        sprintf(msg, "SET %s %s %lld", key, value, ttl);
+        fd_write(main_to_savepipe[1], msg);
     }
     return entry;
 }
 
 int del(const char* key)
 {
-    fprintf(save_fd, "DEL %s\n", key); fflush(save_fd);
+    char msg[MSG_LEN]; msg[0] = 0;
+    sprintf(msg, "DEL %s", key);
+    fd_write(main_to_savepipe[1], msg);
     if (delete_from_hash(key) < 0)
         return -1;
     return 0; 
@@ -881,7 +896,9 @@ int execute_multi_commands(int fd, char queue[][MSG_LEN], int st, int dr)
         return -1;
     }
 
-    fprintf(save_fd, "MULTI\n");
+    // char msg[MSG_LEN]; msg[0] = 0;
+    // sprintf(msg, "MULTI");
+    // fd_write(main_to_savepipe[1], msg);
 
     for (int i = index - 1; i >= 0; i--)
         if (logs[i].type == RESTORE_RAM && logs[i].ram_value != NULL)
@@ -1123,6 +1140,19 @@ void notify_clients(const char* msg)
     for (int i = 0; i < FD_MAX; i++)
         if (clients[i].active == 1 && clients[i].is_client == 1)
             fd_write(i, msg);
+}
+
+void* save_to_file(void *arg)
+{
+    char msg[MSG_LEN]; msg[0] = 0;
+    while(1)
+    {
+        if (fd_read(main_to_savepipe[0], msg) >= 0)
+        {
+            fprintf(save_fd, "%s\n", msg);
+            fflush(save_fd);
+        }
+    }
 }
 
 int load_save_file()
