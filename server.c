@@ -189,12 +189,31 @@ int global_file_end = 0;
 
 Client clients[FD_MAX];
 
+void print_help()
+{
+    printf("Syntax for MASTER: ./server [PORT] MASTER\n");
+    printf("Syntax for SLAVE: ./server [PORT] SLAVE [MASTER_IP] [MASTER_PORT]\n");
+}
+
 int main(int argc, char *argv[])
 {
     //initial setup
+
+    if (argc < 3)
+    {
+        print_help();
+        exit(1);
+    }
+
     PORT = atoi(argv[1]);
     if (argc == 5 && !strcmp(argv[2], "SLAVE"))
         server_type = SLAVE;
+    else
+        if (strcmp(argv[2], "MASTER") != 0 || argc != 3)
+        {
+            print_help();
+            exit(1);    
+        }
 
     if (server_type == MASTER)
         printf("Incepem serverul MASTER...\n");
@@ -206,6 +225,13 @@ int main(int argc, char *argv[])
     {
         printf("Incercam conexiune cu MASTER...\n");
         fflush(stdout);
+
+        if (argc != 5)
+        {
+            print_help();
+            exit(1);
+        }
+
         fd_master = slave_setup(argv[3], atoi(argv[4]));
     }
 
