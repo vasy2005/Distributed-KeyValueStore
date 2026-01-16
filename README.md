@@ -31,11 +31,14 @@ Ensure you have `gcc` and `make` (optional) installed on your Linux environment.
 The Master node is required. It manages writes and data consistency.
 
 Command:
+```bash
 ./server <PORT> MASTER
+```
 
 Example:
+```bash
 ./server 5000 MASTER
-
+```
 
 2. **Start a Slave Server (Optional)**
 Slaves connect to the Master to replicate data and handle read load.
