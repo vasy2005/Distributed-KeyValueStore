@@ -41,19 +41,27 @@ Example:
 Slaves connect to the Master to replicate data and handle read load.
 
 Command:
+```bash
 ./server <SLAVE_PORT> SLAVE <MASTER_IP> <MASTER_PORT>
+```
 
 Example:
+```bash
 ./server 5001 SLAVE 127.0.0.1 5000
+```
 
 
 3. **Run the Client**
 Connect the client to the Master to send commands.
 
 Command:
+```bash
 ./client <SERVER_IP> <SERVER_PORT>
+```
 
 Example:
+```bash
 ./client 127.0.0.1 5000
+```
 
 ---
